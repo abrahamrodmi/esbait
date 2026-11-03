@@ -5,112 +5,108 @@ import joblib
 import numpy as np
 import re
 
-# 1. Inicialización de la aplicación FastAPI
 app = FastAPI(
     title="API de Detección de Phishing (Optimizado con AG)",
-    description="Servicio backend para evaluar correos electrónicos desde Angular",
     version="1.0.0"
 )
 
-# 2. Configuración de CORS (Indispensable para conectar Vercel con Render)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En producción puedes poner el dominio de Vercel: ["https://tu-app.vercel.app"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 3. Carga de artefactos generados en el Notebook (.ipynb) al iniciar el servidor
-try:
-    vectorizer = joblib.load("vectorizer.joblib")
-    best_chromosome = joblib.load("best_chromosome.joblib")  # Máscara de 0s y 1s del AG
-    model = joblib.load("model_ga.joblib")
-    feature_names = np.array(vectorizer.get_feature_names_out())
-    selected_features_names = feature_names[np.array(best_chromosome, dtype=bool)]
-except Exception as e:
-    print(f"Advertencia: Asegúrate de colocar los archivos .joblib en la raíz. Error: {e}")
+# 1. Carga segura de artefactos sin forzar el cruce de dimensiones al inicio
+vectorizer = joblib.load("vectorizer.joblib")
+best_chromosome = np.array(joblib.load("best_chromosome.joblib"), dtype=bool)
+model = joblib.load("model_ga.joblib")
 
+feature_names = np.array(vectorizer.get_feature_names_out())
+n_genes = len(best_chromosome) # 1000 en tu caso
 
-# 4. Modelos de datos (Esquemas de Entrada y Salida con Pydantic)
 class EmailInput(BaseModel):
     texto: str
 
-
-class PredictionOutput(BaseModel):
-    texto_original: str
-    texto_procesado: str
-    clasificacion: str
-    probabilidad_phishing: float
-    terminos_detectados_ag: list[str]
-    indicadores_textuales: list[str]
-
-
-# 5. Función de preprocesamiento (Debe replicar la limpieza de tu Notebook)
 def preprocesar_texto(texto: str) -> str:
     texto = texto.lower()
-    # Reemplazar URLs por un token estándar o conservarlas según tu notebook
     texto = re.sub(r'http\S+|www\.\S+', ' enlaceweb ', texto)
-    # Eliminar caracteres especiales y puntuación
     texto = re.sub(r'[^a-záéíóúñü\s]', '', texto)
-    # Eliminar espacios múltiples
     texto = re.sub(r'\s+', ' ', texto).strip()
     return texto
 
-
-# Función auxiliar para detectar categorías de indicadores según requerimientos
 def obtener_indicadores_semanticos(texto_limpio: str) -> list[str]:
     indicadores = []
-    if any(p in texto_limpio for p in ["urgente", "inmediatamente", "suspendida", "24 horas", "bloqueada", "alerta"]):
-        indicadores.append(" sentido de urgencia o amenaza")
-    if any(p in texto_limpio for p in
-           ["verifique", "confirmar", "actualizar", "datos", "contraseña", "credenciales", "cuenta"]):
-        indicadores.append("solicitud de verificación de cuenta o datos")
-    if any(p in texto_limpio for p in ["enlaceweb", "clic", "link", "enlace", "acceda", "ingrese"]):
-        indicadores.append("solicitud de acceso a enlace externo")
+    if any(p in texto_limpio for p in ["urgente", "inmediatamente", "suspendida", "24 horas", "bloqueada", "alerta", "urgent", "immediately", "suspended"]):
+        indicadores.append("urgencia")
+    if any(p in texto_limpio for p in ["verifique", "confirmar", "actualizar", "datos", "contraseña", "credenciales", "cuenta", "verify", "account", "password"]):
+        indicadores.append("verificación de cuenta")
+    if any(p in texto_limpio for p in ["enlaceweb", "clic", "link", "enlace", "acceda", "ingrese", "click", "login"]):
+        indicadores.append("solicitud de acceso a enlace")
     return indicadores if indicadores else ["sin indicadores críticos evidentes"]
 
-
-# 6. Endpoints de la API
 @app.get("/")
 def health_check():
-    return {"estado": "activo", "servicio": "Detector de Phishing API"}
+    return {
+        "estado": "activo",
+        "dimension_tfidf": len(feature_names),
+        "dimension_cromosoma_ag": n_genes,
+        "caracteristicas_esperadas_modelo": getattr(model, "n_features_in_", "desconocido")
+    }
 
-
-@app.post("/api/analizar", response_model=PredictionOutput)
+@app.post("/api/analizar")
 def analizar_correo(datos: EmailInput):
     if not datos.texto or not datos.texto.strip():
         raise HTTPException(status_code=400, detail="El texto del correo no puede estar vacío.")
 
-    # Paso A: Preparación del texto
+    # Paso A: Limpieza del texto
     texto_limpio = preprocesar_texto(datos.texto)
 
-    # Paso B: Representación TF-IDF completa
+    # Paso B: Vectorización TF-IDF (Genera 20,000 columnas)
     vector_tfidf = vectorizer.transform([texto_limpio]).toarray()
 
-    # Paso C: Filtrado de características mediante el mejor individuo del Algoritmo Genético
-    mascara_booleana = np.array(best_chromosome, dtype=bool)
-    vector_filtrado = vector_tfidf[:, mascara_booleana]
+    # Paso C: Ajustar dimensión al tamaño del cromosoma (1,000) y filtrar con el AG
+    vector_recortado = vector_tfidf[:, :n_genes]
+    nombres_recortados = feature_names[:n_genes]
 
-    # Paso D: Predicción con el modelo optimizado
-    prediccion_clase = model.predict(vector_filtrado)[0]
-    probabilidades = model.predict_proba(vector_filtrado)[0]
+    # Verificamos cuántas columnas espera realmente model_ga.joblib
+    n_esperadas = getattr(model, "n_features_in_", None)
 
-    # Asumiendo que 1 = phishing y 0 = legítimo
-    es_phishing = bool(prediccion_clase == 1)
-    prob_phishing = round(float(probabilidades[1]) * 100, 2)
+    if n_esperadas == int(np.sum(best_chromosome)):
+        # Caso 1: El modelo fue entrenado solo con los genes en 1 del AG
+        vector_final = vector_recortado[:, best_chromosome]
+        nombres_finales = nombres_recortados[best_chromosome]
+    elif n_esperadas == n_genes:
+        # Caso 2: El modelo espera las 1,000 columnas multiplicadas por la máscara (0 y 1)
+        vector_final = vector_recortado * best_chromosome
+        nombres_finales = nombres_recortados
+    else:
+        # Caso 3: El modelo espera las 20,000 columnas originales
+        vector_final = vector_tfidf
+        nombres_finales = feature_names
+
+    # Paso D: Predicción con el modelo
+    prediccion_clase = model.predict(vector_final)[0]
+    es_phishing = str(prediccion_clase).lower() in ['1', 'phishing', 'spam', 'true', 'posible phishing']
     veredicto = "posible phishing" if es_phishing else "legítimo"
 
-    # Paso E: Identificar qué palabras del AG aparecieron en este correo específico
-    indices_activos = np.where(vector_filtrado[0] > 0)[0]
-    terminos_presentes = selected_features_names[indices_activos].tolist()
+    # Probabilidad
+    if hasattr(model, "predict_proba"):
+        probabilidades = model.predict_proba(vector_final)[0]
+        prob_phishing = round(float(probabilidades[1]) * 100, 2) if len(probabilidades) > 1 else 100.0
+    else:
+        prob_phishing = 100.0 if es_phishing else 0.0
 
-    # Paso F: Construir respuesta JSON
-    return PredictionOutput(
-        texto_original=datos.texto,
-        texto_procesado=texto_limpio,
-        clasificacion=veredicto,
-        probabilidad_phishing=prob_phishing,
-        terminos_detectados_ag=terminos_presentes,
-        indicadores_textuales=obtener_indicadores_semanticos(texto_limpio)
-    )
+    # Paso E: Términos detectados
+    indices_activos = np.where(vector_final[0] > 0)[0]
+    terminos_presentes = nombres_finales[indices_activos].tolist()
+
+    return {
+        "texto_original": datos.texto,
+        "texto_procesado": texto_limpio,
+        "clasificacion": veredicto,
+        "probabilidad_phishing": prob_phishing,
+        "terminos_detectados_ag": terminos_presentes,
+        "indicadores_textuales": obtener_indicadores_semanticos(texto_limpio)
+    }
