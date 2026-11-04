@@ -11,12 +11,12 @@ from nltk.stem import WordNetLemmatizer
 # pyrefly: ignore[missing-import]
 from langdetect import detect, DetectorFactory
 # pyrefly: ignore[missing-import]
-from transformers import MarianMTModel, MarianTokenizer
+from deep_translator import GoogleTranslator
 
-# Asegurar resultados consistentes en langdetect
+# Fijar semilla para que langdetect sea determinista
 DetectorFactory.seed = 0
 
-# Descargar recursos de NLTK
+# Descargar recursos ligeros de NLTK
 nltk.download('stopwords', quiet=True)
 nltk.download('wordnet', quiet=True)
 nltk.download('omw-1.4', quiet=True)
@@ -31,11 +31,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 1. TU CELDA DE TRADUCCIÓN (Helsinki-NLP/opus-mt-es-en) ---
-nombre_modelo = "Helsinki-NLP/opus-mt-es-en"
-tokenizador = MarianTokenizer.from_pretrained(nombre_modelo)
-modelo_traduccion = MarianMTModel.from_pretrained(nombre_modelo)
-
+# --- 1. DETECCIÓN DE IDIOMA Y TRADUCCIÓN LIGERA EN RAM (<512 MB) ---
 def detectar_idioma(texto):
     try:
         idioma = detect(texto)
@@ -52,23 +48,10 @@ def traducir_ingles(texto):
     idioma = detectar_idioma(texto)
 
     if idioma == "español":
-        entrada = tokenizador(
-            [texto],
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=512
-        )
-
-        traduccion = modelo_traduccion.generate(
-            **entrada,
-            max_length=512
-        )
-
-        texto = tokenizador.decode(
-            traduccion[0],
-            skip_special_tokens=True
-        )
+        try:
+            texto = GoogleTranslator(source='es', target='en').translate(texto[:4500])
+        except Exception:
+            pass
 
     return texto
 
@@ -104,7 +87,7 @@ selector_chi2 = joblib.load('selector_chi2_update.joblib')
 best_chromosome = np.array(joblib.load('best_chromosome_update.joblib'))
 
 if os.path.exists('model_ga_update.joblib'):
-    model_ga = joblib.load('model_ga.joblib')
+    model_ga = joblib.load('model_ga_update.joblib')
 else:
     model_ga = joblib.load('model.joblib')
 
