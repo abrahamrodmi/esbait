@@ -4,11 +4,24 @@ from pydantic import BaseModel
 import joblib
 import numpy as np
 import re
+import os
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+# pyrefly: ignore[missing-import]
+from langdetect import detect, DetectorFactory
+# pyrefly: ignore[missing-import]
+from transformers import MarianMTModel, MarianTokenizer
 
-app = FastAPI(
-    title="API de Detección de Phishing (Optimizado con AG)",
-    version="1.0.0"
-)
+# Asegurar resultados consistentes en langdetect
+DetectorFactory.seed = 0
+
+# Descargar recursos de NLTK
+nltk.download('stopwords', quiet=True)
+nltk.download('wordnet', quiet=True)
+nltk.download('omw-1.4', quiet=True)
+
+app = FastAPI(title="API Detector de Phishing")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,95 +31,124 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 1. Carga segura de artefactos sin forzar el cruce de dimensiones al inicio
-vectorizer = joblib.load("vectorizer.joblib")
-best_chromosome = np.array(joblib.load("best_chromosome.joblib"), dtype=bool)
-model = joblib.load("model_ga.joblib")
+# --- 1. TU CELDA DE TRADUCCIÓN (Helsinki-NLP/opus-mt-es-en) ---
+nombre_modelo = "Helsinki-NLP/opus-mt-es-en"
+tokenizador = MarianTokenizer.from_pretrained(nombre_modelo)
+modelo_traduccion = MarianMTModel.from_pretrained(nombre_modelo)
 
-feature_names = np.array(vectorizer.get_feature_names_out())
-n_genes = len(best_chromosome) # 1000 en tu caso
+def detectar_idioma(texto):
+    try:
+        idioma = detect(texto)
+        if idioma == "es":
+            return "español"
+        elif idioma == "en":
+            return "ingles"
+        else:
+            return "no compatible"
+    except Exception:
+        return "no compatible"
+
+def traducir_ingles(texto):
+    idioma = detectar_idioma(texto)
+
+    if idioma == "español":
+        entrada = tokenizador(
+            [texto],
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512
+        )
+
+        traduccion = modelo_traduccion.generate(
+            **entrada,
+            max_length=512
+        )
+
+        texto = tokenizador.decode(
+            traduccion[0],
+            skip_special_tokens=True
+        )
+
+    return texto
+
+# --- 2. LIMPIEZA DE TEXTO DEL NOTEBOOK ---
+stop = (set(stopwords.words('english')) - {'now', 'not', 'no'}) | {
+    'html', 'alternative', 'strong', 'nbsp', 'font', 'href',
+    'enron', 'ect', 'wrote', 'mailing', 'list',
+    'january', 'february', 'march', 'april', 'may', 'june', 'july',
+    'august', 'september', 'october', 'november', 'december'
+}
+lemma = WordNetLemmatizer()
+
+def preparar_texto(t):
+    t = t.lower()
+    t = re.sub(r'content-type:.*|mime-version:.*|multipart/\S+|text/(html|plain)|charset=\S+', ' ', t)
+    t = re.sub(r'-{2,}\s*original message\s*-{2,}', ' ', t)
+    t = re.sub(r'on .{0,80}wrote:', ' ', t)
+    t = re.sub(r'posting guide.{0,200}?reproducible code', ' ', t, flags=re.DOTALL)
+    t = re.sub(r'^(from|to|cc|bcc|sent|date):.*$', ' ', t, flags=re.MULTILINE)
+    t = re.sub(r'^subject:', ' ', t, flags=re.MULTILINE)
+    t = re.sub(r'<[^>]+>', ' ', t)
+    t = re.sub(r'http\S+|www\.\S+', ' tokurl ', t)
+    t = re.sub(r'\S+@\S+', ' tokemail ', t)
+    t = re.sub(r'[$€£]\s?\d[\d,\.]*', ' tokmoney ', t)
+    t = re.sub(r'\d+', ' toknum ', t)
+    t = re.sub(r'[^a-z\s]', ' ', t)
+    tokens = [lemma.lemmatize(w) for w in t.split() if w not in stop and len(w) > 2]
+    return ' '.join(tokens)
+
+# --- 3. CARGAR LOS 4 ARTEFACTOS JOBLIB ---
+tfidf = joblib.load('vectorizer_update.joblib')
+selector_chi2 = joblib.load('selector_chi2_update.joblib')
+best_chromosome = np.array(joblib.load('best_chromosome_update.joblib'))
+
+if os.path.exists('model_ga_update.joblib'):
+    model_ga = joblib.load('model_ga.joblib')
+else:
+    model_ga = joblib.load('model.joblib')
+
+if len(best_chromosome) > 1000:
+    best_chromosome = best_chromosome[:1000]
 
 class EmailInput(BaseModel):
     texto: str
 
-def preprocesar_texto(texto: str) -> str:
-    texto = texto.lower()
-    texto = re.sub(r'http\S+|www\.\S+', ' enlaceweb ', texto)
-    texto = re.sub(r'[^a-záéíóúñü\s]', '', texto)
-    texto = re.sub(r'\s+', ' ', texto).strip()
-    return texto
-
-def obtener_indicadores_semanticos(texto_limpio: str) -> list[str]:
-    indicadores = []
-    if any(p in texto_limpio for p in ["urgente", "inmediatamente", "suspendida", "24 horas", "bloqueada", "alerta", "urgent", "immediately", "suspended"]):
-        indicadores.append("urgencia")
-    if any(p in texto_limpio for p in ["verifique", "confirmar", "actualizar", "datos", "contraseña", "credenciales", "cuenta", "verify", "account", "password"]):
-        indicadores.append("verificación de cuenta")
-    if any(p in texto_limpio for p in ["enlaceweb", "clic", "link", "enlace", "acceda", "ingrese", "click", "login"]):
-        indicadores.append("solicitud de acceso a enlace")
-    return indicadores if indicadores else ["sin indicadores críticos evidentes"]
+# --- 4. FLUJO DE PREDICCIÓN ---
+def predecir_correo(texto_recibido):
+    # 1. Traducir (si aplica) y limpiar el texto usando tus funciones del notebook
+    texto_traducido = traducir_ingles(texto_recibido)
+    texto_limpio = preparar_texto(texto_traducido)
+    
+    # 2. Vectorizar con TF-IDF (Pasa de texto a 20,000 dimensiones)
+    features_tfidf = tfidf.transform([texto_limpio])
+    
+    # 3. Reducir con Chi-cuadrado (Pasa de 20,000 a 1,000 dimensiones)
+    features_chi2 = selector_chi2.transform(features_tfidf)
+    
+    # 4. Filtrar con el Cromosoma del Algoritmo Genético
+    features_ga = features_chi2[:, best_chromosome == 1]
+    
+    # 5. Obtener veredicto y probabilidades de Phishing
+    prediccion = model_ga.predict(features_ga)[0]
+    probabilidades = model_ga.predict_proba(features_ga)[0]
+    
+    veredicto = "Phishing" if prediccion == 1 else "Legítimo"
+    porcentaje_legitimo = probabilidades[0] * 100
+    porcentaje_phishing = probabilidades[1] * 100
+    
+    return {
+        "veredicto": veredicto,
+        "probabilidad_legitimo": f"{porcentaje_legitimo:.2f}%",
+        "probabilidad_phishing": f"{porcentaje_phishing:.2f}%"
+    }
 
 @app.get("/")
 def health_check():
-    return {
-        "estado": "activo",
-        "dimension_tfidf": len(feature_names),
-        "dimension_cromosoma_ag": n_genes,
-        "caracteristicas_esperadas_modelo": getattr(model, "n_features_in_", "desconocido")
-    }
+    return {"estado": "activo"}
 
 @app.post("/api/analizar")
 def analizar_correo(datos: EmailInput):
     if not datos.texto or not datos.texto.strip():
         raise HTTPException(status_code=400, detail="El texto del correo no puede estar vacío.")
-
-    # Paso A: Limpieza del texto
-    texto_limpio = preprocesar_texto(datos.texto)
-
-    # Paso B: Vectorización TF-IDF (Genera 20,000 columnas)
-    vector_tfidf = vectorizer.transform([texto_limpio]).toarray()
-
-    # Paso C: Ajustar dimensión al tamaño del cromosoma (1,000) y filtrar con el AG
-    vector_recortado = vector_tfidf[:, :n_genes]
-    nombres_recortados = feature_names[:n_genes]
-
-    # Verificamos cuántas columnas espera realmente model_ga.joblib
-    n_esperadas = getattr(model, "n_features_in_", None)
-
-    if n_esperadas == int(np.sum(best_chromosome)):
-        # Caso 1: El modelo fue entrenado solo con los genes en 1 del AG
-        vector_final = vector_recortado[:, best_chromosome]
-        nombres_finales = nombres_recortados[best_chromosome]
-    elif n_esperadas == n_genes:
-        # Caso 2: El modelo espera las 1,000 columnas multiplicadas por la máscara (0 y 1)
-        vector_final = vector_recortado * best_chromosome
-        nombres_finales = nombres_recortados
-    else:
-        # Caso 3: El modelo espera las 20,000 columnas originales
-        vector_final = vector_tfidf
-        nombres_finales = feature_names
-
-    # Paso D: Predicción con el modelo
-    prediccion_clase = model.predict(vector_final)[0]
-    es_phishing = str(prediccion_clase).lower() in ['1', 'phishing', 'spam', 'true', 'posible phishing']
-    veredicto = "posible phishing" if es_phishing else "legítimo"
-
-    # Probabilidad
-    if hasattr(model, "predict_proba"):
-        probabilidades = model.predict_proba(vector_final)[0]
-        prob_phishing = round(float(probabilidades[1]) * 100, 2) if len(probabilidades) > 1 else 100.0
-    else:
-        prob_phishing = 100.0 if es_phishing else 0.0
-
-    # Paso E: Términos detectados
-    indices_activos = np.where(vector_final[0] > 0)[0]
-    terminos_presentes = nombres_finales[indices_activos].tolist()
-
-    return {
-        "texto_original": datos.texto,
-        "texto_procesado": texto_limpio,
-        "clasificacion": veredicto,
-        "probabilidad_phishing": prob_phishing,
-        "terminos_detectados_ag": terminos_presentes,
-        "indicadores_textuales": obtener_indicadores_semanticos(texto_limpio)
-    }
+    return predecir_correo(datos.texto)
