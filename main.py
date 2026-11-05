@@ -44,6 +44,7 @@ def detectar_idioma(texto):
     except Exception:
         return "no compatible"
 
+
 def traducir_ingles(texto):
     idioma = detectar_idioma(texto)
 
@@ -64,6 +65,7 @@ stop = (set(stopwords.words('english')) - {'now', 'not', 'no'}) | {
 }
 lemma = WordNetLemmatizer()
 
+
 def preparar_texto(t):
     t = t.lower()
     t = re.sub(r'content-type:.*|mime-version:.*|multipart/\S+|text/(html|plain)|charset=\S+', ' ', t)
@@ -81,54 +83,122 @@ def preparar_texto(t):
     tokens = [lemma.lemmatize(w) for w in t.split() if w not in stop and len(w) > 2]
     return ' '.join(tokens)
 
-# --- 3. CARGAR LOS 4 ARTEFACTOS JOBLIB ---
+# --- 3. CARGAR ARTEFACTOS JOBLIB ---
+# Compartidos por los 4 modelos: TF-IDF (20,000) -> Chi² (1,000)
 tfidf = joblib.load('vectorizer_update.joblib')
 selector_chi2 = joblib.load('selector_chi2_update.joblib')
-best_chromosome = np.array(joblib.load('best_chromosome_update.joblib'))
 
-if os.path.exists('model_ga_update.joblib'):
-    model_ga = joblib.load('model_ga_update.joblib')
-else:
-    model_ga = joblib.load('model.joblib')
 
-if len(best_chromosome) > 1000:
-    best_chromosome = best_chromosome[:1000]
+def _cargar_mascara(ruta):
+    """Carga un cromosoma y se queda solo con los primeros 1000 genes
+    (los de selección de características; los 5 últimos del AG con
+    regularización codifican lambda y no son columnas)."""
+    mascara = np.array(joblib.load(ruta))
+    return mascara[:1000]
+
+
+# Cada modelo tiene su modelo entrenado y (opcionalmente) su máscara de características.
+# mascara=None -> usa las 1000 características de Chi² (Regresión Logística base).
+CONFIG_MODELOS = [
+    {
+        "id": "lr",
+        "nombre": "Regresión Logística (base, K=1000)",
+        "modelo": "modelo_base_lr.joblib",
+        "mascara": None,
+    },
+    {
+        "id": "ga",
+        "nombre": "Algoritmo Genético + Regresión Logística",
+        "modelo": "modelo_final_ga.joblib",
+        "mascara": "best_chromosome_update.joblib",
+    },
+    {
+        "id": "l1",
+        "nombre": "Algoritmo Genético + Regularización L1",
+        "modelo": "modelo_final_ga_l1.joblib",
+        "mascara": "chromosome_l1.joblib",
+    },
+    {
+        "id": "l2",
+        "nombre": "Algoritmo Genético + Regularización L2",
+        "modelo": "modelo_final_ga_l2.joblib",
+        "mascara": "chromosome_l2.joblib",
+    },
+]
+
+MODELOS = []
+for cfg in CONFIG_MODELOS:
+    if not os.path.exists(cfg["modelo"]):
+        print(f"[AVISO] No se encontró {cfg['modelo']}; se omite el modelo '{cfg['id']}'.")
+        continue
+    mascara = None
+    if cfg["mascara"] is not None:
+        if not os.path.exists(cfg["mascara"]):
+            print(f"[AVISO] No se encontró {cfg['mascara']}; se omite el modelo '{cfg['id']}'.")
+            continue
+        mascara = _cargar_mascara(cfg["mascara"]) == 1
+    MODELOS.append({
+        "id": cfg["id"],
+        "nombre": cfg["nombre"],
+        "modelo": joblib.load(cfg["modelo"]),
+        "mascara": mascara,
+    })
+
+if not MODELOS:
+    raise RuntimeError("No se pudo cargar ningún modelo. Revisa los archivos .joblib.")
+
 
 class EmailInput(BaseModel):
     texto: str
 
 # --- 4. FLUJO DE PREDICCIÓN ---
 def predecir_correo(texto_recibido):
-    # 1. Traducir (si aplica) y limpiar el texto usando tus funciones del notebook
+    # 1. Traducir (si aplica) y limpiar el texto (una sola vez para los 4 modelos)
+    idioma = detectar_idioma(texto_recibido)
     texto_traducido = traducir_ingles(texto_recibido)
     texto_limpio = preparar_texto(texto_traducido)
-    
-    # 2. Vectorizar con TF-IDF (Pasa de texto a 20,000 dimensiones)
+
+    # 2. TF-IDF (20,000 dim) y 3. Chi² (1,000 dim): compartidos
     features_tfidf = tfidf.transform([texto_limpio])
-    
-    # 3. Reducir con Chi-cuadrado (Pasa de 20,000 a 1,000 dimensiones)
     features_chi2 = selector_chi2.transform(features_tfidf)
-    
-    # 4. Filtrar con el Cromosoma del Algoritmo Genético
-    features_ga = features_chi2[:, best_chromosome == 1]
-    
-    # 5. Obtener veredicto y probabilidades de Phishing
-    prediccion = model_ga.predict(features_ga)[0]
-    probabilidades = model_ga.predict_proba(features_ga)[0]
-    
-    veredicto = "Phishing" if prediccion == 1 else "Legítimo"
-    porcentaje_legitimo = probabilidades[0] * 100
-    porcentaje_phishing = probabilidades[1] * 100
-    
+
+    # 4. Cada modelo aplica su propia máscara y predice
+    resultados = []
+    votos_phishing = 0
+    for m in MODELOS:
+        features = features_chi2 if m["mascara"] is None else features_chi2[:, m["mascara"]]
+
+        prediccion = int(m["modelo"].predict(features)[0])
+        probabilidades = m["modelo"].predict_proba(features)[0]
+
+        es_phishing = prediccion == 1
+        votos_phishing += int(es_phishing)
+
+        resultados.append({
+            "id": m["id"],
+            "nombre": m["nombre"],
+            "veredicto": "Phishing" if es_phishing else "Legítimo",
+            "probabilidad_legitimo": round(float(probabilidades[0]) * 100, 2),
+            "probabilidad_phishing": round(float(probabilidades[1]) * 100, 2),
+        })
+
+    total = len(resultados)
     return {
-        "veredicto": veredicto,
-        "probabilidad_legitimo": f"{porcentaje_legitimo:.2f}%",
-        "probabilidad_phishing": f"{porcentaje_phishing:.2f}%"
+        "idioma_detectado": idioma,
+        "resultados": resultados,
+        "consenso": {
+            "veredicto": "Phishing" if votos_phishing > total / 2 else "Legítimo",
+            "votos_phishing": votos_phishing,
+            "votos_legitimo": total - votos_phishing,
+            "total_modelos": total,
+        },
     }
+
 
 @app.get("/")
 def health_check():
-    return {"estado": "activo"}
+    return {"estado": "activo", "modelos_cargados": [m["id"] for m in MODELOS]}
+
 
 @app.post("/api/analizar")
 def analizar_correo(datos: EmailInput):
